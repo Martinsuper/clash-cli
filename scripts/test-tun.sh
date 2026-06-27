@@ -26,9 +26,16 @@ pass "Unit tests passed"
 # --- 2. Runtime config has dns.listen ---
 info "Checking runtime config for dns.listen..."
 if [ -f "$RUNTIME_YAML" ]; then
-    if grep -q "listen:" "$RUNTIME_YAML"; then
-        listen_line=$(grep "listen:" "$RUNTIME_YAML")
-        pass "dns.listen present: $listen_line"
+    if python3 - "$RUNTIME_YAML" <<'PY'
+import sys
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    cfg = yaml.safe_load(f)
+assert cfg["dns"]["listen"] == "0.0.0.0:53"
+PY
+    then
+        pass "dns.listen present: 0.0.0.0:53"
     else
         fail "dns.listen not found in $RUNTIME_YAML"
     fi
@@ -36,7 +43,15 @@ else
     info "Runtime config not found, generating..."
     $CLASH_CLI update 2>/dev/null
     RUNTIME_YAML=$("$CLASH_CLI" paths 2>/dev/null | grep "runtime:" | sed 's/runtime: //')
-    if grep -q "listen:" "$RUNTIME_YAML"; then
+    if python3 - "$RUNTIME_YAML" <<'PY'
+import sys
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    cfg = yaml.safe_load(f)
+assert cfg["dns"]["listen"] == "0.0.0.0:53"
+PY
+    then
         pass "dns.listen present after update"
     else
         fail "dns.listen still missing after update"
@@ -45,7 +60,15 @@ fi
 
 # --- 3. TUN section in runtime config ---
 info "Checking TUN section..."
-if grep -q "enable: true" "$RUNTIME_YAML" && grep -q "tun:" "$RUNTIME_YAML"; then
+if python3 - "$RUNTIME_YAML" <<'PY'
+import sys
+import yaml
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    cfg = yaml.safe_load(f)
+assert cfg["tun"]["enable"] is True
+PY
+then
     pass "TUN enabled in runtime config"
 else
     fail "TUN not enabled in runtime config"
@@ -53,9 +76,9 @@ fi
 
 # --- 4. Check mihomo process is running ---
 info "Checking mihomo process..."
-MIMOMO_PID=$(pgrep -f "mihomo" 2>/dev/null | head -1 || true)
-if [ -n "$MIMOMO_PID" ]; then
-    pass "mihomo running (PID $MIMOMO_PID)"
+MIHOMO_PID=$(pgrep -f "mihomo" 2>/dev/null | head -1 || true)
+if [ -n "$MIHOMO_PID" ]; then
+    pass "mihomo running (PID $MIHOMO_PID)"
 else
     fail "mihomo not running"
 fi
@@ -121,11 +144,18 @@ fi
 
 # --- 11. Routing table check ---
 info "Checking routing table..."
-CIDR_ROUTES=$(netstat -rn 2>/dev/null | grep -c "utun1" || true)
+TUN_DEVICE=$(ifconfig 2>/dev/null | awk '
+  /^[a-z0-9]+:/ { iface=$1; sub(":", "", iface) }
+  /inet 198\.18\./ { print iface; exit }
+')
+CIDR_ROUTES=0
+if [ -n "$TUN_DEVICE" ]; then
+    CIDR_ROUTES=$(netstat -rn 2>/dev/null | grep -c "$TUN_DEVICE" || true)
+fi
 if [ "$CIDR_ROUTES" -gt 3 ]; then
-    pass "Routing table has $CIDR_ROUTES utun1 entries"
+    pass "Routing table has $CIDR_ROUTES $TUN_DEVICE entries"
 else
-    fail "Routing table missing utun1 routes (found $CIDR_ROUTES)"
+    fail "Routing table missing TUN routes (device=${TUN_DEVICE:-unknown}, found $CIDR_ROUTES)"
 fi
 
 echo ""

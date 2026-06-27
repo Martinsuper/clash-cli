@@ -14,13 +14,21 @@ mihomo 的 external-controller 自动切换到可用节点。
 - 自动 ping/延迟测试节点并切换到最快可用节点
 - 当当前订阅节点全部不通时，自动重新更新订阅、reload 配置并再次切换
 - 支持生成 TUN 虚拟网卡配置
+- 支持 macOS、Linux、Windows 的 TUN 权限检查和系统 DNS 临时设置/恢复
 - 支持配置自定义规则和 `rule-providers`
 
 ## 安装/构建
 
 ```bash
-cd /Volumes/W_W/claude-workspace/clash-cli
-cargo build --release
+cd .
+scripts/build-release.sh
+```
+
+脚本会编译 release 版本，并把可执行文件复制到 `dist/`。也可以指定 Rust target：
+
+```bash
+scripts/build-release.sh x86_64-unknown-linux-gnu
+scripts/build-release.sh x86_64-pc-windows-msvc
 ```
 
 需要本机已有 `mihomo` 可执行文件，并确保它在 `PATH` 中，或在初始化时指定路径。
@@ -30,20 +38,20 @@ cargo build --release
 最简单的首次启动：
 
 ```bash
-/Volumes/W_W/claude-workspace/clash-cli/target/release/clash-cli \
+target/release/clash-cli \
   "https://your-jms-subscription.example/clash.yaml"
 ```
 
 之后再启动只需要下面这一行。它会优先使用上次订阅生成的本地节点配置，不会每次启动都拉订阅：
 
 ```bash
-/Volumes/W_W/claude-workspace/clash-cli/target/release/clash-cli
+target/release/clash-cli
 ```
 
 如果 `mihomo` 不在 `PATH` 中，首次启动时顺手指定一下：
 
 ```bash
-/Volumes/W_W/claude-workspace/clash-cli/target/release/clash-cli \
+target/release/clash-cli \
   --mihomo-bin /usr/local/bin/mihomo \
   "https://your-jms-subscription.example/clash.yaml"
 ```
@@ -152,6 +160,7 @@ tun:
 
 dns:
   enable: true
+  listen: 0.0.0.0:53
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
   nameserver:
@@ -170,20 +179,34 @@ rules:
 rule-providers: {}
 ```
 
+## 平台支持
+
+- macOS：完整支持普通代理和 TUN。TUN 只会影响 mihomo 的运行时配置，不会直接改系统 DNS。
+- Linux：支持普通代理和 TUN。TUN 只会影响 mihomo 的运行时配置，不会直接改系统 DNS。
+- Windows：支持普通代理和 TUN。TUN 只会影响 mihomo 的运行时配置，不会直接改系统 DNS。
+
 ## TUN 注意事项
 
 开启 `tun.enable: true` 后，mihomo 通常需要管理员权限或相应系统授权：
 
 ```bash
-sudo /Volumes/W_W/claude-workspace/clash-cli/target/release/clash-cli --tun
+sudo target/release/clash-cli --tun
 ```
 
-TUN 的实际创建、路由和 DNS 劫持都由 mihomo 执行，本工具只负责生成对应配置。
+Windows 上请在管理员 PowerShell 或管理员终端中运行：
+
+```powershell
+clash-cli.exe --tun
+```
+
+TUN 的实际创建、路由和 DNS 劫持由 mihomo 执行。本工具只生成运行时 `tun` 和 `dns` 配置，不会修改系统 DNS。若你想控制 DNS 行为，请在 `dns` 段里调整 `listen`、`enhanced-mode`、`nameserver` 和 `fallback`。
+
+macOS/Linux 通过 `sudo` 运行且没有显式传 `--config` 时，程序会优先读取原登录用户的默认配置目录，避免误读 root 用户目录下的空配置。显式传 `--config` 时，配置文件路径以命令行为准。
 
 ## 自动化验证
 
 ```bash
-cd /Volumes/W_W/claude-workspace/clash-cli
+cd .
 scripts/smoke-test.sh
 ```
 
@@ -192,8 +215,8 @@ scripts/smoke-test.sh
 实际网络诊断可以用：
 
 ```bash
-/Volumes/W_W/claude-workspace/clash-cli/target/release/clash-cli doctor
-/Volumes/W_W/claude-workspace/clash-cli/target/release/clash-cli doctor "https://example.com"
+target/release/clash-cli doctor
+target/release/clash-cli doctor "https://example.com"
 ```
 
 它会检查配置、runtime、mihomo 控制端口、混合代理端口、直连访问、代理访问、TUN 线索和系统代理线索。

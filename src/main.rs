@@ -21,6 +21,10 @@ const APP_QUALIFIER: &str = "io.github";
 const APP_ORG: &str = "clash-cli";
 const APP_NAME: &str = "clash-cli";
 const DEFAULT_TEST_URL: &str = "http://cp.cloudflare.com/generate_204";
+const MACOS_DNS_SERVICE: &str = "Wi-Fi";
+const MACOS_APP_DIR: &str = "io.github.clash-cli.clash-cli";
+#[cfg(all(unix, not(target_os = "macos")))]
+const LINUX_APP_DIR: &str = "clash-cli";
 
 #[derive(Parser, Debug)]
 #[command(name = "clash-cli")]
@@ -363,9 +367,29 @@ impl QuickSetup {
 }
 
 fn resolve_paths(config: Option<PathBuf>) -> Result<Paths> {
+    if let Some(config) = config {
+        if let Some(mut paths) = sudo_user_paths() {
+            paths.config = config;
+            return Ok(paths);
+        }
+
+        let dirs = ProjectDirs::from(APP_QUALIFIER, APP_ORG, APP_NAME)
+            .ok_or_else(|| anyhow!("failed to resolve platform config directories"))?;
+        return Ok(Paths {
+            config,
+            data_dir: dirs.data_dir().to_path_buf(),
+            runtime_config: dirs.data_dir().join("runtime.yaml"),
+            cache_dir: dirs.cache_dir().to_path_buf(),
+        });
+    }
+
+    if let Some(paths) = sudo_user_paths() {
+        return Ok(paths);
+    }
+
     let dirs = ProjectDirs::from(APP_QUALIFIER, APP_ORG, APP_NAME)
         .ok_or_else(|| anyhow!("failed to resolve platform config directories"))?;
-    let config = config.unwrap_or_else(|| dirs.config_dir().join("config.yaml"));
+    let config = dirs.config_dir().join("config.yaml");
     let data_dir = dirs.data_dir().to_path_buf();
     let cache_dir = dirs.cache_dir().to_path_buf();
     let runtime_config = data_dir.join("runtime.yaml");
@@ -375,6 +399,87 @@ fn resolve_paths(config: Option<PathBuf>) -> Result<Paths> {
         runtime_config,
         cache_dir,
     })
+}
+
+#[cfg(target_os = "macos")]
+fn sudo_user_paths() -> Option<Paths> {
+    let sudo_user = std::env::var("SUDO_USER").ok()?;
+    if sudo_user.is_empty() || sudo_user == "root" {
+        return None;
+    }
+
+    let home =
+        macos_user_home(&sudo_user).unwrap_or_else(|| PathBuf::from("/Users").join(&sudo_user));
+    let app_dir = home
+        .join("Library")
+        .join("Application Support")
+        .join(MACOS_APP_DIR);
+    let cache_dir = home.join("Library").join("Caches").join(MACOS_APP_DIR);
+
+    Some(Paths {
+        config: app_dir.join("config.yaml"),
+        data_dir: app_dir.clone(),
+        runtime_config: app_dir.join("runtime.yaml"),
+        cache_dir,
+    })
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn sudo_user_paths() -> Option<Paths> {
+    let sudo_user = std::env::var("SUDO_USER").ok()?;
+    if sudo_user.is_empty() || sudo_user == "root" {
+        return None;
+    }
+
+    let home =
+        unix_user_home(&sudo_user).unwrap_or_else(|| PathBuf::from("/home").join(&sudo_user));
+    let config_dir = home.join(".config").join(LINUX_APP_DIR);
+    let data_dir = home.join(".local").join("share").join(LINUX_APP_DIR);
+    let cache_dir = home.join(".cache").join(LINUX_APP_DIR);
+
+    Some(Paths {
+        config: config_dir.join("config.yaml"),
+        data_dir: data_dir.clone(),
+        runtime_config: data_dir.join("runtime.yaml"),
+        cache_dir,
+    })
+}
+
+#[cfg(not(unix))]
+fn sudo_user_paths() -> Option<Paths> {
+    None
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn unix_user_home(user: &str) -> Option<PathBuf> {
+    let output = StdCommand::new("getent")
+        .args(["passwd", user])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let text = String::from_utf8(output.stdout).ok()?;
+        if let Some(home) = text.split(':').nth(5).filter(|home| !home.is_empty()) {
+            return Some(PathBuf::from(home));
+        }
+    }
+
+    std::env::var("SUDO_HOME").ok().map(PathBuf::from)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_user_home(user: &str) -> Option<PathBuf> {
+    let output = StdCommand::new("dscl")
+        .args([".", "-read", &format!("/Users/{user}"), "NFSHomeDirectory"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8(output.stdout).ok()?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("NFSHomeDirectory: "))
+        .map(PathBuf::from)
 }
 
 fn init_config(
@@ -394,18 +499,20 @@ fn init_config(
         fs::create_dir_all(parent)?;
     }
 
-    let mut cfg = AppConfig::default();
-    cfg.subscriptions = urls
-        .into_iter()
-        .enumerate()
-        .map(|(idx, url)| Subscription {
-            name: format!("sub-{}", idx + 1),
-            url,
-            user_agent: Some("clash-cli/0.1".to_string()),
-            include: vec![],
-            exclude: vec![],
-        })
-        .collect();
+    let mut cfg = AppConfig {
+        subscriptions: urls
+            .into_iter()
+            .enumerate()
+            .map(|(idx, url)| Subscription {
+                name: format!("sub-{}", idx + 1),
+                url,
+                user_agent: Some("clash-cli/0.1".to_string()),
+                include: vec![],
+                exclude: vec![],
+            })
+            .collect(),
+        ..Default::default()
+    };
     if let Some(bin) = mihomo_bin {
         cfg.mihomo.bin = bin;
     }
@@ -488,20 +595,35 @@ async fn run(paths: Paths, no_core: bool, refresh_on_start: bool) -> Result<()> 
         Some(start_mihomo(&paths, &cfg).await?)
     };
 
-    wait_for_controller(&cfg).await?;
-    check_once(&paths, &cfg).await?;
+    let result = async {
+        wait_for_controller(&cfg).await?;
+        check_once(&paths, &cfg).await?;
+        run_health_loop(&paths, &cfg, &mut child).await
+    }
+    .await;
 
+    if let Some(child) = child.as_mut()
+        && child.try_wait()?.is_none()
+    {
+        let _ = child.kill().await;
+    }
+
+    result
+}
+
+async fn run_health_loop(
+    paths: &Paths,
+    cfg: &AppConfig,
+    child: &mut Option<tokio::process::Child>,
+) -> Result<()> {
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 info!("received Ctrl-C");
-                if let Some(child) = child.as_mut() {
-                    let _ = child.kill().await;
-                }
                 return Ok(());
             }
             _ = sleep(Duration::from_secs(cfg.proxy.health_check_secs.max(5))) => {
-                if let Err(err) = check_once(&paths, &cfg).await {
+                if let Err(err) = check_once(paths, cfg).await {
                     warn!("health check failed: {err:#}");
                 }
                 if let Some(child) = child.as_mut()
@@ -516,14 +638,24 @@ async fn run(paths: Paths, no_core: bool, refresh_on_start: bool) -> Result<()> 
 fn ensure_can_start_core(cfg: &AppConfig) -> Result<()> {
     if cfg.tun.enable && !is_elevated() {
         bail!(
-            "TUN mode usually requires administrator privileges. Try: sudo {} --tun",
-            std::env::current_exe()
-                .ok()
-                .and_then(|path| path.into_os_string().into_string().ok())
-                .unwrap_or_else(|| "clash-cli".to_string())
+            "TUN mode usually requires administrator privileges. Try: {}",
+            elevated_run_hint()
         );
     }
     Ok(())
+}
+
+fn elevated_run_hint() -> String {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.into_os_string().into_string().ok())
+        .unwrap_or_else(|| "clash-cli".to_string());
+
+    if cfg!(windows) {
+        format!("run an Administrator terminal, then execute: {exe} --tun")
+    } else {
+        format!("sudo {exe} --tun")
+    }
 }
 
 #[cfg(unix)]
@@ -537,13 +669,24 @@ fn is_elevated() -> bool {
         == Some(0)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn is_elevated() -> bool {
+    let script = r#"
+$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+"#;
+    powershell_output(script)
+        .ok()
+        .is_some_and(|output| output.trim().eq_ignore_ascii_case("true"))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn is_elevated() -> bool {
     false
 }
 
 async fn ensure_runtime_config(paths: &Paths, cfg: &AppConfig, refresh: bool) -> Result<()> {
-    if refresh || !paths.runtime_config.exists() {
+    if refresh || !paths.runtime_config.exists() || runtime_config_stale(paths) {
         update_runtime_config(paths, cfg).await?;
     } else {
         info!(
@@ -552,6 +695,25 @@ async fn ensure_runtime_config(paths: &Paths, cfg: &AppConfig, refresh: bool) ->
         );
     }
     Ok(())
+}
+
+fn runtime_config_stale(paths: &Paths) -> bool {
+    let Ok(config_modified) = paths
+        .config
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+    else {
+        return false;
+    };
+    let Ok(runtime_modified) = paths
+        .runtime_config
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+    else {
+        return true;
+    };
+
+    config_modified > runtime_modified
 }
 
 async fn check(paths: Paths) -> Result<()> {
@@ -666,7 +828,8 @@ async fn doctor(paths: Paths, url: &str) -> Result<()> {
             report_warn(
                 "system proxy hint",
                 &format!(
-                    "Wi-Fi HTTP proxy points to {}:{}, but clash-cli mixed-port is {}",
+                    "{} HTTP proxy points to {}:{}, but clash-cli mixed-port is {}",
+                    proxy.service,
                     proxy.server.as_deref().unwrap_or(""),
                     proxy.port.map(|port| port.to_string()).unwrap_or_default(),
                     cfg.mihomo.mixed_port
@@ -704,9 +867,13 @@ async fn http_probe(url: &str, proxy_port: Option<u16>) -> Result<String> {
 
     let started = std::time::Instant::now();
     let response = builder.build()?.get(url).send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("HTTP {status}");
+    }
     Ok(format!(
         "HTTP {} in {} ms",
-        response.status(),
+        status,
         started.elapsed().as_millis()
     ))
 }
@@ -727,6 +894,7 @@ fn report_info(label: &str, detail: &str) {
     println!("[INFO] {label}: {detail}");
 }
 
+#[cfg(unix)]
 fn tun_route_hint() -> bool {
     StdCommand::new("ifconfig")
         .output()
@@ -735,8 +903,261 @@ fn tun_route_hint() -> bool {
         .is_some_and(|text| text.contains("198.18.0.1"))
 }
 
+#[cfg(windows)]
+fn tun_route_hint() -> bool {
+    let script = r#"
+Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+  Where-Object { $_.IPAddress -like '198.18.*' } |
+  Select-Object -First 1 -ExpandProperty IPAddress
+"#;
+    powershell_output(script).is_ok_and(|output| !output.trim().is_empty())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn tun_route_hint() -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn active_macos_network_service() -> Option<String> {
+    let default_interface = macos_default_interface()?;
+    macos_network_services()
+        .ok()?
+        .into_iter()
+        .find_map(|(interface, service)| (interface == default_interface).then_some(service))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_default_interface() -> Option<String> {
+    let output = StdCommand::new("route")
+        .args(["-n", "get", "default"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8(output.stdout)
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("interface: ")
+                .map(ToOwned::to_owned)
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_network_services() -> Result<Vec<(String, String)>> {
+    let output = StdCommand::new("networksetup")
+        .arg("-listallhardwareports")
+        .output()
+        .with_context(|| "failed to run networksetup -listallhardwareports")?;
+    if !output.status.success() {
+        bail!(
+            "networksetup -listallhardwareports failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let text = String::from_utf8(output.stdout)?;
+    let mut services = Vec::new();
+    let mut service: Option<String> = None;
+    for line in text.lines().map(str::trim) {
+        if let Some(value) = line.strip_prefix("Hardware Port: ") {
+            service = Some(value.to_string());
+        } else if let Some(device) = line.strip_prefix("Device: ")
+            && let Some(service) = service.take()
+        {
+            services.push((device.to_string(), service));
+        }
+    }
+    Ok(services)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn linux_default_interface() -> Option<String> {
+    let output = StdCommand::new("ip")
+        .args(["route", "show", "default"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8(output.stdout).ok()?;
+    text.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        while let Some(part) = parts.next() {
+            if part == "dev" {
+                return parts.next().map(ToOwned::to_owned);
+            }
+        }
+        None
+    })
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn linux_dns_servers(interface: &str) -> Result<Vec<String>> {
+    let output = StdCommand::new("resolvectl")
+        .args(["dns", interface])
+        .output()
+        .with_context(|| "failed to run resolvectl dns")?;
+    if !output.status.success() {
+        bail!(
+            "resolvectl dns failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout
+        .lines()
+        .filter_map(|line| line.split_once(':').map(|(_, rest)| rest))
+        .flat_map(str::split_whitespace)
+        .filter(|server| !server.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn set_linux_dns_servers(interface: &str, servers: &[String]) -> Result<()> {
+    let output = StdCommand::new("resolvectl")
+        .arg("dns")
+        .arg(interface)
+        .args(servers)
+        .output()
+        .with_context(|| "failed to run resolvectl dns")?;
+    if output.status.success() {
+        info!("Linux DNS for {interface} set to {}", servers.join(", "));
+        return Ok(());
+    }
+
+    bail!(
+        "failed to set Linux DNS for {interface}: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn revert_linux_dns(interface: &str) -> Result<()> {
+    let output = StdCommand::new("resolvectl")
+        .args(["revert", interface])
+        .output()
+        .with_context(|| "failed to run resolvectl revert")?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    bail!(
+        "failed to revert Linux DNS for {interface}: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+#[cfg(windows)]
+fn windows_default_adapter_alias() -> Option<String> {
+    let script = r#"
+$route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+  Sort-Object RouteMetric, InterfaceMetric |
+  Select-Object -First 1
+if ($null -ne $route) {
+  (Get-NetAdapter -InterfaceIndex $route.InterfaceIndex -ErrorAction SilentlyContinue).InterfaceAlias
+}
+"#;
+    powershell_output(script)
+        .ok()
+        .map(|output| output.trim().to_string())
+        .filter(|output| !output.is_empty())
+}
+
+#[cfg(windows)]
+fn windows_dns_servers(alias: &str) -> Result<Vec<String>> {
+    let script = format!(
+        r#"
+$addresses = (Get-DnsClientServerAddress -InterfaceAlias '{}' -AddressFamily IPv4 -ErrorAction Stop).ServerAddresses
+if ($null -ne $addresses) {{ $addresses -join "`n" }}
+"#,
+        powershell_quote(alias)
+    );
+    Ok(powershell_output(&script)?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+#[cfg(windows)]
+fn set_windows_dns_servers(alias: &str, servers: &[String]) -> Result<()> {
+    let script = if servers.is_empty() {
+        format!(
+            "Set-DnsClientServerAddress -InterfaceAlias '{}' -ResetServerAddresses -ErrorAction Stop",
+            powershell_quote(alias)
+        )
+    } else {
+        let quoted = servers
+            .iter()
+            .map(|server| format!("'{}'", powershell_quote(server)))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "Set-DnsClientServerAddress -InterfaceAlias '{}' -ServerAddresses @({}) -ErrorAction Stop",
+            powershell_quote(alias),
+            quoted
+        )
+    };
+
+    let _ = powershell_output(&script)?;
+    info!(
+        "Windows DNS for {alias} set to {}",
+        if servers.is_empty() {
+            "automatic".to_string()
+        } else {
+            servers.join(", ")
+        }
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn powershell_output(script: &str) -> Result<String> {
+    let output = StdCommand::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .with_context(|| "failed to run PowerShell")?;
+    if !output.status.success() {
+        bail!(
+            "PowerShell command failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(windows)]
+fn powershell_quote(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn command_exists(command: &str) -> bool {
+    StdCommand::new(command)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+}
+
 #[derive(Debug)]
 struct SystemProxyHint {
+    service: String,
     enabled: bool,
     server: Option<String>,
     port: Option<u16>,
@@ -745,7 +1166,8 @@ struct SystemProxyHint {
 impl SystemProxyHint {
     fn summary(&self) -> String {
         format!(
-            "Wi-Fi HTTP enabled={} server={} port={}",
+            "{} HTTP enabled={} server={} port={}",
+            self.service,
             if self.enabled { "Yes" } else { "No" },
             self.server.as_deref().unwrap_or(""),
             self.port.map(|port| port.to_string()).unwrap_or_default()
@@ -753,9 +1175,11 @@ impl SystemProxyHint {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn system_proxy_hint() -> Option<SystemProxyHint> {
+    let service = active_macos_network_service().unwrap_or_else(|| MACOS_DNS_SERVICE.to_string());
     let output = StdCommand::new("networksetup")
-        .args(["-getwebproxy", "Wi-Fi"])
+        .args(["-getwebproxy", &service])
         .output()
         .ok()?;
     let text = String::from_utf8(output.stdout).ok()?;
@@ -772,12 +1196,19 @@ fn system_proxy_hint() -> Option<SystemProxyHint> {
         .find_map(|line| line.strip_prefix("Port: "))
         .and_then(|value| value.parse::<u16>().ok());
     Some(SystemProxyHint {
+        service,
         enabled: enabled == "Yes",
         server,
         port,
     })
 }
 
+#[cfg(not(target_os = "macos"))]
+fn system_proxy_hint() -> Option<SystemProxyHint> {
+    None
+}
+
+#[cfg(unix)]
 fn mihomo_process_hint() -> Option<Vec<String>> {
     let output = StdCommand::new("pgrep")
         .args(["-af", "verge-mihomo|mihomo|clash-cli|Clash Verge"])
@@ -794,23 +1225,75 @@ fn mihomo_process_hint() -> Option<Vec<String>> {
     )
 }
 
+#[cfg(windows)]
+fn mihomo_process_hint() -> Option<Vec<String>> {
+    let script = r#"
+Get-Process -ErrorAction SilentlyContinue |
+  Where-Object { $_.ProcessName -match 'mihomo|clash-cli|clash' } |
+  Select-Object -First 6 -Property Id,ProcessName,Path |
+  ForEach-Object { "$($_.Id) $($_.ProcessName) $($_.Path)" }
+"#;
+    powershell_output(script).ok().map(|text| {
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn mihomo_process_hint() -> Option<Vec<String>> {
+    None
+}
+
 async fn check_once(paths: &Paths, cfg: &AppConfig) -> Result<()> {
     let client = ApiClient::new(cfg)?;
     match choose_and_switch(&client, cfg).await {
         Ok(best) => {
             info!("proxy ok: {} ({} ms)", best.name, best.delay);
+            if let Err(err) =
+                http_probe(&cfg.proxy.test_url, Some(cfg.mihomo.mixed_port)).await
+            {
+                warn!(
+                    "delay test passed but actual traffic failed: {err:#}, triggering subscription update"
+                );
+                do_update_and_reload(paths, cfg, &client).await?;
+            }
             Ok(())
         }
         Err(first_err) => {
             warn!("no reachable proxy before update: {first_err:#}");
-            update_runtime_config(paths, cfg).await?;
-            let _ = client.reload_config(&paths.runtime_config).await;
-            let best = choose_and_switch(&client, cfg).await?;
+            do_update_and_reload(paths, cfg, &client).await?;
+            Ok(())
+        }
+    }
+}
+
+async fn do_update_and_reload(
+    paths: &Paths,
+    cfg: &AppConfig,
+    client: &ApiClient,
+) -> Result<()> {
+    update_runtime_config(paths, cfg).await?;
+    client
+        .reload_config(&paths.runtime_config)
+        .await
+        .with_context(
+            || "failed to reload mihomo runtime config after subscription update",
+        )?;
+    sleep(Duration::from_secs(2)).await;
+    match choose_and_switch(client, cfg).await {
+        Ok(best) => {
             info!(
                 "proxy recovered after subscription update: {} ({} ms)",
                 best.name, best.delay
             );
             Ok(())
+        }
+        Err(err) => {
+            warn!("subscription update did not recover proxy: {err:#}");
+            Err(err)
         }
     }
 }
@@ -1076,7 +1559,7 @@ fn decode_url_component(input: &str) -> Option<String> {
         .map(|value| value.into_owned())
 }
 
-fn split_once<'a>(value: &'a str, delimiter: char) -> (&'a str, &'a str) {
+fn split_once(value: &str, delimiter: char) -> (&str, &str) {
     value.split_once(delimiter).unwrap_or((value, ""))
 }
 
@@ -1492,6 +1975,7 @@ proxies:
 
         assert_eq!(runtime["mixed-port"].as_i64(), Some(7890));
         assert_eq!(runtime["tun"]["enable"].as_bool(), Some(true));
+        assert_eq!(runtime["dns"]["listen"].as_str(), Some("0.0.0.0:53"));
         assert_eq!(runtime["dns"]["enhanced-mode"].as_str(), Some("fake-ip"));
         assert_eq!(runtime["proxy-groups"][0]["name"].as_str(), Some("AUTO"));
         assert_eq!(runtime["proxy-groups"][1]["name"].as_str(), Some("PROXY"));
